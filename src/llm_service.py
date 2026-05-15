@@ -33,16 +33,20 @@ def build_context(scored_docs):
     return "\n\n".join(parts)
 
 def get_evidence_label(scored_docs):
+    """Score evidence based on FAISS L2 distance (lower = better match)."""
     if not scored_docs:
         return "Low"
 
     best_score = scored_docs[0][1]
+    avg_score = sum(score for _, score in scored_docs) / len(scored_docs)
 
-    if best_score < 0.8:
-        return "High"
-    elif best_score < 1.5:
-        return "Medium"
-    return "Low"
+    # Lower FAISS L2 distance = better semantic match
+    # Typical good matches are 0.3-0.7, poor matches are > 1.0
+    if best_score < 0.5:
+        return "High"  # Excellent semantic match
+    elif best_score < 0.8:
+        return "Medium"  # Good match
+    return "Low"  # Weak match
 
 def prepare_sources(scored_docs):
     sources = []
@@ -80,23 +84,26 @@ def answer_question(vectorstore, question, k=4):
     evidence = get_evidence_label(scored_docs)
     context = build_context(scored_docs)
 
-    if evidence == "Low":
-        return {
-            "answer": "I could not find enough evidence in the uploaded documents.",
-            "evidence": evidence,
-            "sources": prepare_sources(scored_docs)
-        }
-
+    # Always attempt to generate an answer, regardless of evidence level
     prompt = get_qa_prompt()
     chain = prompt | llm
 
-    response = chain.invoke({
-        "question": question,
-        "context": context
-    })
+    try:
+        response = chain.invoke({
+            "question": question,
+            "context": context
+        })
+        answer = response.content
+    except Exception as e:
+        answer = f"Error generating answer: {str(e)}"
 
     return {
-        "answer": response.content,
+        "answer": answer,
         "evidence": evidence,
         "sources": prepare_sources(scored_docs)
     }
+
+
+def run_mode(vectorstore, user_input, mode="Q&A", k=4):
+    """Compatibility wrapper used by app.py for the current UI modes."""
+    return answer_question(vectorstore, user_input, k=k)
