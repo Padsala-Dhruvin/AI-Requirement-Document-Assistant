@@ -3,6 +3,9 @@ from dotenv import load_dotenv
 import pandas as pd
 import os
 import html
+from src.document_loader import load_pdf_documents_grouped
+from src.vector_store import create_vectorstores_for_documents
+from src.llm_service import compare_documents
 
 from src.document_loader import load_pdf_documents
 from src.text_processor import split_documents
@@ -84,10 +87,13 @@ if "last_result" not in st.session_state:
 
 if "last_question" not in st.session_state:
     st.session_state.last_question = None
+    
+if "vectorstores_by_doc" not in st.session_state:
+    st.session_state.vectorstores_by_doc = {}
 
 mode = st.sidebar.selectbox(
     "Choose mode",
-    ["Q&A", "Summary", "Requirements Extraction"]
+    ["Q&A", "Summary", "Requirements Extraction", "Document Comparison"]
 )
 
 uploaded_files = st.file_uploader(
@@ -99,9 +105,19 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     if st.button("Process Documents"):
         with st.spinner("Loading and indexing documents..."):
-            documents = load_pdf_documents(uploaded_files)
-            chunks = split_documents(documents)
-            st.session_state.vectorstore = create_vectorstore(chunks)
+            grouped_docs = load_pdf_documents_grouped(uploaded_files)
+
+            grouped_chunks = {}
+            all_chunks = []
+
+            for filename, docs in grouped_docs.items():
+                chunks = split_documents(docs)
+                grouped_chunks[filename] = chunks
+                all_chunks.extend(chunks)
+
+            st.session_state.vectorstore = create_vectorstore(all_chunks)
+            st.session_state.vectorstores_by_doc = create_vectorstores_for_documents(grouped_chunks)
+
         st.success("Documents processed successfully!")
 
 if mode == "Q&A":
@@ -111,83 +127,123 @@ elif mode == "Summary":
 else:
     user_input = st.text_area("Write what requirements you want extracted, or leave it blank")
 
-if user_input:
-    if st.session_state.vectorstore is None:
-        st.warning("Please upload and process documents first.")
-    else:
-        with st.spinner("Running mode..."):
-            result = run_mode(st.session_state.vectorstore, user_input, mode=mode)
+if mode == "Document Comparison":
+    available_docs = list(st.session_state.vectorstores_by_doc.keys())
 
-        st.session_state.last_result = result
-        st.session_state.last_question = user_input
+    if len(available_docs) >= 2:
+        col1, col2 = st.columns(2)
 
-        save_interaction(
-            question=user_input,
-            answer=result["answer"],
-            evidence=result["evidence"],
-            sources=result["sources"],
-            feedback="pending"
-        )
+        with col1:
+            doc_a = st.selectbox("Select Document A", available_docs)
 
-if st.session_state.last_result:
-    result = st.session_state.last_result
+        with col2:
+            default_index = 1 if len(available_docs) > 1 else 0
+            doc_b = st.selectbox("Select Document B", available_docs, index=default_index)
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    with metric_col1:
-        st.metric("Evidence", result["evidence"])
-    with metric_col2:
-        st.metric("Sources", len(result["sources"]))
-    with metric_col3:
-        st.metric("Mode", mode)
+        compare_query = st.text_input("What do you want to compare?")
 
-    st.markdown("<div class='section-label'>Answer</div>", unsafe_allow_html=True)
-    st.markdown(
-        f"<div class='answer-card'>{render_answer_block(result['answer'])}</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<div class='section-label' style='margin-top:1.2rem;'>Sources</div>", unsafe_allow_html=True)
-    if result["sources"]:
-        for i, item in enumerate(result["sources"], start=1):
-            with st.container():
-                st.markdown(
-                    f"""
-                    <div class='source-card'>
-                        <strong>Source {i}:</strong> {item['source']}<br>
-                        <strong>Page:</strong> {item['page']}<br>
-                        <strong>Similarity distance:</strong> {item['score']}<br>
-                        <div style='margin-top:0.6rem; color:#374151;'>{item['snippet']}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+        if compare_query:
+            with st.spinner("Comparing documents..."):
+                result = compare_documents(
+                    st.session_state.vectorstores_by_doc[doc_a],
+                    st.session_state.vectorstores_by_doc[doc_b],
+                    compare_query
                 )
+
+            st.subheader("Comparison Result")
+            st.markdown(result["answer"])
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.subheader("Sources from Document A")
+                for i, item in enumerate(result["sources_a"], start=1):
+                    with st.expander(f"A{i}: {item['source']} | Page {item['page']}"):
+                        st.markdown(f"**Similarity distance:** {item['score']}")
+                        st.write(item["snippet"])
+
+            with col_b:
+                st.subheader("Sources from Document B")
+                for i, item in enumerate(result["sources_b"], start=1):
+                    with st.expander(f"B{i}: {item['source']} | Page {item['page']}"):
+                        st.markdown(f"**Similarity distance:** {item['score']}")
+                        st.write(item["snippet"])
     else:
-        st.info("No supporting sources found.")
+        st.info("Please upload at least two PDF documents for comparison.")
 
-    st.subheader("Feedback")
-    col1, col2 = st.columns(2)
+else:
+    if mode == "Q&A":
+        user_input = st.text_input("Ask a question from your uploaded documents")
+    elif mode == "Summary":
+        user_input = st.text_area("Write what you want summarized")
+    else:
+        user_input = st.text_area("Write what requirements you want extracted")
 
-    with col1:
-        if st.button("👍 Helpful"):
+    if user_input:
+        if st.session_state.vectorstore is None:
+            st.warning("Please upload and process documents first.")
+        else:
+            with st.spinner("Running mode..."):
+                result = run_mode(st.session_state.vectorstore, user_input, mode=mode)
+
+            st.session_state.last_result = result
+            st.session_state.last_question = user_input
+
             save_interaction(
-                question=st.session_state.last_question,
+                question=user_input,
                 answer=result["answer"],
                 evidence=result["evidence"],
                 sources=result["sources"],
-                feedback="helpful"
+                feedback="pending"
             )
-            st.success("Feedback saved: Helpful")
 
-    with col2:
-        if st.button("👎 Not Helpful"):
-            save_interaction(
-                question=st.session_state.last_question,
-                answer=result["answer"],
-                evidence=result["evidence"],
-                sources=result["sources"],
-                feedback="not_helpful"
-            )
-            st.warning("Feedback saved: Not Helpful")
+    if st.session_state.last_result:
+        result = st.session_state.last_result
+
+        st.subheader("Output")
+        st.markdown(result["answer"])
+
+        st.subheader("Evidence Level")
+        if result["evidence"] == "High":
+            st.success("High evidence")
+        elif result["evidence"] == "Medium":
+            st.warning("Medium evidence")
+        else:
+            st.error("Low evidence")
+
+        st.subheader("Sources")
+        if result["sources"]:
+            for i, item in enumerate(result["sources"], start=1):
+                with st.expander(f"Source {i}: {item['source']} | Page {item['page']}"):
+                    st.markdown(f"**Similarity distance:** {item['score']}")
+                    st.write(item["snippet"])
+        else:
+            st.info("No supporting sources found.")
+
+        st.subheader("Feedback")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("👍 Helpful"):
+                save_interaction(
+                    question=st.session_state.last_question,
+                    answer=result["answer"],
+                    evidence=result["evidence"],
+                    sources=result["sources"],
+                    feedback="helpful"
+                )
+                st.success("Feedback saved: Helpful")
+
+        with col2:
+            if st.button("👎 Not Helpful"):
+                save_interaction(
+                    question=st.session_state.last_question,
+                    answer=result["answer"],
+                    evidence=result["evidence"],
+                    sources=result["sources"],
+                    feedback="not_helpful"
+                )
+                st.warning("Feedback saved: Not Helpful")
 
 st.divider()
 st.subheader("Feedback Log Preview")
